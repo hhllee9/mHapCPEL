@@ -89,37 +89,70 @@ def get_u(a: float) -> np.ndarray:
 # print(u)
 
 
-def comp_Z(n: np.ndarray, a: np.ndarray, b: float):
-    y = np.dot(get_u(a[0]).T, get_W(n[0], a[0], b))
+def _site_fields(n, a):
+    """Expand nonempty subregion fields to the CpG chain."""
+    counts = np.asarray(n)
+    fields = np.asarray(a, dtype=float)
+    if (counts.ndim != 1 or fields.ndim != 1 or counts.size == 0
+            or counts.size != fields.size or not np.all(np.isfinite(counts))
+            or np.any(counts <= 0) or np.any(counts != np.floor(counts))):
+        raise ValueError("n must contain positive integer CpG counts, one per alpha")
+    if not np.all(np.isfinite(fields)):
+        raise ValueError("alpha must be finite")
+    return np.repeat(fields, counts.astype(int))
 
-    for i in range(1, len(n)):
-        V = get_V(a[i-1:i+1], b)                                   # shape: (2,2)
-        Wi = get_W(n[i], a[i], b)                       # shape: (2,2)
-        y = y @ V @ Wi                                                     #  (1,2)
 
-    y = (y @ get_u(a[-1])) [0,0]
-    return max(1e-100, y)
-## check
+def _log_partition_fields(h, b):
+    """Two-state transfer recursion in log space; never forms exp(logZ)."""
+    if not np.isfinite(b):
+        raise ValueError("beta must be finite")
+    log_minus, log_plus = -h[0], h[0]
+    for field in h[1:]:
+        next_minus = -field + np.logaddexp(log_minus + b, log_plus - b)
+        next_plus = field + np.logaddexp(log_minus - b, log_plus + b)
+        log_minus, log_plus = next_minus, next_plus
+    return float(np.logaddexp(log_minus, log_plus))
+
+
+def comp_logZ(n: np.ndarray, a: np.ndarray, b: float) -> float:
+    """Compute log(Z) directly, including when Z exceeds Float64 range."""
+    return _log_partition_fields(_site_fields(n, a), float(b))
+
+
+def _exp_partition(log_value, name):
+    # Compatibility for external callers that actually need Z or g.
+    if not np.isfinite(log_value) or log_value > np.log(np.finfo(float).max):
+        raise OverflowError(f"{name} exceeds float range; use its log-space function")
+    return float(np.exp(log_value))
+
+
+def comp_Z(n: np.ndarray, a: np.ndarray, b: float) -> float:
+    """Compatibility wrapper returning Z. Internal calculations use comp_logZ."""
+    return _exp_partition(comp_logZ(n, a, b), "Z")
+
+# # check
 # n = np.array([1,1,1])
 # a = np.array([1.0,2.0,3.0])
 # b = 1.0
 # Z = comp_Z(n,a,b)
 # Ux_fun = create_Ux(n,a,b)
 # from itertools import product
-# Generate all rows with three columns, where each column takes a value from {-1, +1}.
+# # Generate all rows with three columns, where each column takes a value from {-1, +1}.
 # M = np.array(list(product([-1, 1], repeat=3)), dtype=int)
 # def f(x):
 #     return 1.0 / np.exp(Ux_fun(x))
 # total = sum(f(row) for row in M)
+# Z_ln = comp_logZ(n, a, b)
 # print(Z)
 # print(total)
+# print("exp(logZ):", np.exp(Z_ln))
 
 
 
 
 def get_grad_logZ(n:np.ndarray, θhat: np.ndarray) -> np.ndarray:
     def f(θ):
-        return np.log(comp_Z(n, θ[:-1], θ[-1])).item()  
+        return comp_logZ(n, θ[:-1], θ[-1])
 
 
     grad_logZ = approx_derivative(f, θhat, method="3-point",rel_step=1e-6)  
@@ -171,18 +204,22 @@ def check_boundary(θhat: np.ndarray) -> bool:
 # print(check_boundary([1.0, 1.0, 1.0, 1.0]))  # 输出: False
 # print(check_boundary([1.0, 5.0, 1.0, 1.0]))  # 输出: True
 
-def comp_g(r: np.ndarray, a: np.ndarray, b: float, ap1: float, ap2: float) ->float:
+def comp_log_g(r: np.ndarray, a: np.ndarray, b: float, ap1: float, ap2: float) -> float:
+    """Log of a missing-segment partition factor with modified boundaries."""
+    r = np.asarray(r)
     if r.size == 0 or np.all(r == 0):
-        return 1.0
-    
-    y = get_u(ap1).T @ get_W(r[0],a[0],b)
+        return 0.0
+    h = _site_fields(r, a)
+    # The original transfer matrix splits each endpoint field in half.
+    # For a one-site segment both adjustments apply to that same site.
+    h[0] += 0.5 * (ap1 - a[0])
+    h[-1] += 0.5 * (ap2 - a[-1])
+    return _log_partition_fields(h, float(b))
 
-    for i in range(1,r.size):
-        y = y @ get_V(a[i-1:i+1], b) @ get_W(r[i], a[i], b)
 
-    y = (y @ get_u(ap2))[0,0]
-
-    return max(1e-100, y)
+def comp_g(r: np.ndarray, a: np.ndarray, b: float, ap1: float, ap2: float) -> float:
+    """Compatibility wrapper; use comp_log_g for likelihoods and sampling."""
+    return _exp_partition(comp_log_g(r, a, b, ap1, ap2), "g")
 
 # # check
 # r=np.array([1])
@@ -193,65 +230,26 @@ def comp_g(r: np.ndarray, a: np.ndarray, b: float, ap1: float, ap2: float) ->flo
 
 #Marginalized Methylation Probability
 def comp_lkhd(x: np.ndarray, n: np.ndarray, a: np.ndarray, b: float) -> float:
+    """Probability of a full/partial read, formed only after log normalization."""
+    x = np.asarray(x, dtype=float)
+    n = np.asarray(n, dtype=int)
+    theta = np.r_[np.asarray(a, dtype=float), b]
+    log_p = -create_Llkhd(n, x.reshape(1, -1))(theta)
+    return float(np.exp(min(0.0, log_p)))
 
-    if x.size== 1:
-        return 0.5 * np.exp(x[0] * a[0])/np.cosh(a[0])
-    N = x.size
-    absx = np.abs(x)
-    Z = comp_Z(n,a,b)
-    Ux = create_Ux(n,a,b)
-    #d[i]=|x(i+1)|-|xi|
-    d = absx[1:] - absx[:-1]
-    zerost = np.flatnonzero(d == -1) + 1
-    zeroend = np.flatnonzero(d == 1) + 1
 
-    if x[0] == 0:
-        zerost = np.insert(zerost, 0, 0)
-    if x[-1] == 0:
-        zeroend = np.append(zeroend, N)
-
-    subid = np.repeat(np.arange(1, len(n) + 1), n)
-
-    sf = 1.0
-    for s, e in zip(zerost, zeroend):
-        ap1 = a[0] if s == 0 else 2.0 * x[s - 1] * b + a[subid[s] - 1]
-        ap2 = a[-1] if e == N else 2.0 * x[e] * b + a[subid[e - 1] - 1]
-        b_id = subid[s:e]
-        if b_id.size == 0:
-            continue
-        uniq, counts = np.unique(b_id, return_counts=True)
-        n_miss = counts.astype(int)
-        a_sub = a[uniq - 1]
-        sf *= comp_g(n_miss, a_sub, b, ap1, ap2)
-        
-
-    return float(np.exp(-Ux(x)) * sf / Z)
-
-# # check
-#Comparing two probability functions
-# Z = comp_Z([5],[1.0],1.0)
-# Ux_fun = create_Ux([5], [1.0], 1.0)
-# u1=1.0/np.exp(Ux_fun([1,1,-1,1,1]))
-# result_1=u1/Z
-# print(result_1)
-# result_2 = comp_lkhd([1, 1, -1, 1, 1], [5], [1.0], 1.0)
-# print(result_2) 
-# result_3 = comp_lkhd([1, 1, 0, 1, 1], [5], [1.0], 1.0)
-# print(result_3) 
-# u2=1.0/np.exp(Ux_fun([1,1,1,1,1]))
-# result_4=(u1+u2)/Z
-# print(result_4)
-
-# x=np.array([0,0,1,1,0,0,0,-1,-1,0,0])
-# n=np.array([5,6])
-# a=np.array([1.0,2.0])
-# b=2.0
-# result=comp_lkhd(x,n,a,b)
-# print(result)
 
 
 #Maximum Likelihood Function
 def create_Llkhd(n: np.ndarray, xobs: np.ndarray) -> Callable[[List[float]], float]:
+    n_array = np.asarray(n)
+    _site_fields(n_array, np.zeros(len(n_array)))  # validate counts before casting
+    n = n_array.astype(int)
+    xobs = np.asarray(xobs, dtype=float)
+    if xobs.ndim != 2 or xobs.shape[1] != n.sum():
+        raise ValueError("xobs must be a reads-by-CpG matrix with sum(n) columns")
+    if not np.all(np.isin(xobs, [-1, 0, 1])):
+        raise ValueError("xobs must use -1/1 for observed states and 0 for missing")
 
     subid = np.repeat(np.arange(1, len(n) + 1), n)
     N = xobs.shape[1]
@@ -269,7 +267,7 @@ def create_Llkhd(n: np.ndarray, xobs: np.ndarray) -> Callable[[List[float]], flo
 
         # Get energy function and partition function
         Ux = create_Ux(n, a, b)
-        logZ = np.log(comp_Z(n, a, b))
+        logZ = comp_logZ(n, a, b)
 
         # Initialize variables used in for loop
         ap1 = ap2 = 0.0  
@@ -296,7 +294,7 @@ def create_Llkhd(n: np.ndarray, xobs: np.ndarray) -> Callable[[List[float]], flo
                 a_sub = a[uniq - 1]
                 # print("a_sub*:",a_sub)
 
-                aux += np.log(comp_g(n_miss, a_sub, b, ap1, ap2))
+                aux += comp_log_g(n_miss, a_sub, b, ap1, ap2)
 
             # Add log of it to Llkhd
             aux += -Ux(x)
@@ -305,7 +303,27 @@ def create_Llkhd(n: np.ndarray, xobs: np.ndarray) -> Callable[[List[float]], flo
         return -aux + len(xobs) * logZ
 
     return Llkhd_fun
+# # check
+# # Comparing two probability functions
+# Z = comp_Z([5],[1.0],1.0)
+# Ux_fun = create_Ux([5], [1.0], 1.0)
+# u1=1.0/np.exp(Ux_fun(np.array([1,1,-1,1,1])))
+# result_1=u1/Z
+# print(result_1)
+# result_2 = comp_lkhd(np.array([1, 1, -1, 1, 1]), [5], [1.0], 1.0)
+# print(result_2) 
+# result_3 = comp_lkhd(np.array([1, 1, 0, 1, 1]), [5], [1.0], 1.0)
+# print(result_3) 
+# u2=1.0/np.exp(Ux_fun(np.array([1,1,1,1,1])))
+# result_4=(u1+u2)/Z
+# print(result_4)
 
+# x=np.array([0,0,1,1,0,0,0,-1,-1,0,0])
+# n=np.array([5,6])
+# a=np.array([1.0,2.0])
+# b=2.0
+# result=comp_lkhd(x,n,a,b)
+# print(result)
 # #check
 # xobs =  [[-1,  0, 0, 1],
 #          [ 0,  0, -1, 0]]
@@ -317,8 +335,8 @@ def create_Llkhd(n: np.ndarray, xobs: np.ndarray) -> Callable[[List[float]], flo
 # result_1=LogLike(theta)
 # print(result_1)
 # #比较
-# u1=comp_lkhd([-1,-1, -1, 1], [4], [1.0], 1.0)
-# u2=comp_lkhd([ 1, 1, -1, 1], [4], [1.0], 1.0)
+# u1=comp_lkhd(np.array([-1,-1, -1, 1]), [4], [1.0], 1.0)
+# u2=comp_lkhd(np.array([ 1, 1, -1, 1]), [4], [1.0], 1.0)
 # result_2 = -np.log(u1)-np.log(u2)
 # print(result_1)
 # print(result_2)
@@ -383,6 +401,8 @@ def simulated_annealing(
         current_pos = np.clip(current_pos, [a for (a, _) in bounds], [b for (_, b) in bounds])
 
     current_val = func(current_pos)
+    if not np.isfinite(current_val):
+        raise ValueError("Initial objective is not finite")
     best_pos, best_val = current_pos.copy(), float(current_val)
     temp = initial_temp
     
@@ -391,7 +411,7 @@ def simulated_annealing(
         new_pos = current_pos + np.random.normal(0, 1, dim) * temp
         new_pos = np.clip(new_pos, [b[0] for b in bounds], [b[1] for b in bounds])
         new_val = func(new_pos)
-        if (new_val < current_val) or (random.random() < np.exp((current_val - new_val) / max(temp, T_EPS))):
+        if np.isfinite(new_val) and ((new_val < current_val) or (random.random() < np.exp(min(0.0, (current_val - new_val) / max(temp, T_EPS))))):
             current_pos, current_val = new_pos, new_val
             if new_val < best_val:
                 if (f_tol is not None) and ((best_val - new_val) < f_tol):
@@ -423,6 +443,8 @@ def hybrid_simulated_annealing(
         current_pos = np.clip(current_pos, [a for (a, _) in bounds], [b for (_, b) in bounds])
 
     current_val = func(current_pos)
+    if not np.isfinite(current_val):
+        raise ValueError("Initial objective is not finite")
     best_pos, best_val = current_pos.copy(), float(current_val)
     temp = initial_temp
 
@@ -436,7 +458,7 @@ def hybrid_simulated_annealing(
         new_pos = np.clip(new_pos, [b[0] for b in bounds], [b[1] for b in bounds])
         new_val = func(new_pos); nfev += 1
 
-        if (new_val < current_val) or (random.random() < np.exp((current_val - new_val) / max(temp, T_EPS))):
+        if np.isfinite(new_val) and ((new_val < current_val) or (random.random() < np.exp(min(0.0, (current_val - new_val) / max(temp, T_EPS))))):
             current_pos, current_val = new_pos, new_val
 
             if new_val < best_val:
@@ -448,7 +470,7 @@ def hybrid_simulated_annealing(
         if (i + 1) % local_search_interval == 0:
             res = minimize(func, current_pos, bounds=bounds, method=local_search_method)
             nfev += res.nfev if hasattr(res, "nfev") else 0
-            if res.success and res.fun < best_val:
+            if res.success and np.isfinite(res.fun) and res.fun < best_val:
                 best_pos, best_val = res.x.copy(), res.fun
                 current_pos, current_val = res.x.copy(), res.fun
 
@@ -485,15 +507,15 @@ def comp_mml(n:np.ndarray, grad_logZ) -> float:
     return float(np.abs(np.round(0.5 * (1.0 + grad_logZ[:len(n)].sum() / n.sum()), 8)))
 
 
-## check
-# n = np.array([1,1,1])
-# θ = np.array([1.0,-1.0,3.0,4.0])
-# grad_logZ = get_grad_logZ(n,θ)
+# # check
+n = np.array([1,1,1])
+θ = np.array([1.0,-1.0,3.0,4.0])
+grad_logZ = get_grad_logZ(n,θ)
 # result_mml=comp_mml(n,grad_logZ)
-# print(result)
+# print(result_mml)
 
 def comp_nme(n: np.ndarray, θ: np.ndarray, grad_logZ: np.ndarray) -> float:
-    return float(np.abs(np.round((np.log(comp_Z(n, θ[:-1], θ[-1])) - np.dot(θ, grad_logZ)) / (n.sum() * np.log(2.0)),8)))
+    return float(np.abs(np.round((comp_logZ(n, θ[:-1], θ[-1]) - np.dot(θ, grad_logZ)) / (n.sum() * np.log(2.0)),8)))
 
 # result_nme=comp_nme(n,θ,grad_logZ)
 # n = np.array([10])
@@ -503,14 +525,17 @@ def comp_nme(n: np.ndarray, θ: np.ndarray, grad_logZ: np.ndarray) -> float:
 # grad_logZ2 = get_grad_logZ(n,θ2)
 # result_nme1=comp_nme(n,θ1,grad_logZ1)
 # result_nme2=comp_nme(n,θ2,grad_logZ2)
+# print(result_nme)
+# print(result_nme1)
+# print(result_nme2)  
 
 def comp_cmd(n: np.ndarray, θ1: np.ndarray, θ2: np.ndarray, grad_logZ1, grad_logZ2) -> float: 
     
     θγ = 0.5 * (θ1+θ2)
 
-    logZ1 = np.log(comp_Z(n, θ1[:-1], θ1[-1]))
-    logZ2 = np.log(comp_Z(n, θ2[:-1], θ2[-1]))
-    logZγ = np.log(comp_Z(n, θγ[:-1], θγ[-1]))
+    logZ1 = comp_logZ(n, θ1[:-1], θ1[-1])
+    logZ2 = comp_logZ(n, θ2[:-1], θ2[-1])
+    logZγ = comp_logZ(n, θγ[:-1], θγ[-1])
 
     cmd = logZ1 + logZ2 - (np.dot(θ1, grad_logZ1) + np.dot(θ2, grad_logZ2))
 
@@ -523,9 +548,9 @@ def comp_cmd(n: np.ndarray, θ1: np.ndarray, θ2: np.ndarray, grad_logZ1, grad_l
 
 def comp_cmd_unnorm(n: np.ndarray, θ1: np.ndarray, θ2: np.ndarray, grad_logZ1: np.ndarray, grad_logZ2: np.ndarray) -> float:
     θγ = 0.5 * (θ1 + θ2)
-    logZ1 = np.log(comp_Z(n, θ1[:-1], θ1[-1]))
-    logZ2 = np.log(comp_Z(n, θ2[:-1], θ2[-1]))
-    logZγ = np.log(comp_Z(n, θγ[:-1], θγ[-1]))
+    logZ1 = comp_logZ(n, θ1[:-1], θ1[-1])
+    logZ2 = comp_logZ(n, θ2[:-1], θ2[-1])
+    logZγ = comp_logZ(n, θγ[:-1], θγ[-1])
     cmd = 2.0 * logZγ - np.dot(θγ, (grad_logZ1 + grad_logZ2)) - (logZ1 + logZ2 - (np.dot(θ1, grad_logZ1) + np.dot(θ2, grad_logZ2)))
     return float(cmd)
 
@@ -549,14 +574,12 @@ def comp_pdr(n: np.ndarray, θ: np.ndarray) -> float:
     total_cpgs = int(n.sum())
     a_dot_n = float(np.dot(θ[:-1], n))
     b = float(θ[-1])
-    logZ = float(np.log(comp_Z(n, θ[:-1], b)))
+    logZ = float(comp_logZ(n, θ[:-1], b))
 
     # log(cosh(x)) = logaddexp(x, -x) - log(2)
     log_cosh = float(np.logaddexp(a_dot_n, -a_dot_n) - np.log(2.0))
     log_num = np.log(2.0) + (total_cpgs - 1) * b + log_cosh
-    pdr = float(np.exp(log_num - logZ))
-    pdr = float(np.clip(pdr, 0.0, 1.0))
-    return float(1.0 - pdr)
+    return float(-np.expm1(min(0.0, log_num - logZ)))
 
 # #check
 # n=np.array([200])
@@ -568,13 +591,11 @@ def comp_chalm(n: np.ndarray, θ: np.ndarray) -> float:
     total_cpgs = int(n.sum())
     a_dot_n = float(np.dot(θ[:-1], n))
     b = float(θ[-1])
-    logZ = float(np.log(comp_Z(n, θ[:-1], b)))
+    logZ = float(comp_logZ(n, θ[:-1], b))
 
     # chalm = exp(-(a·n - b(N-1))) / Z
     log_num = -(a_dot_n - b * (total_cpgs - 1))
-    chalm = float(np.exp(log_num - logZ))
-    chalm = float(np.clip(chalm, 0.0, 1.0))
-    return (1.0-chalm)
+    return float(-np.expm1(min(0.0, log_num - logZ)))
 
 # # check
 # n=np.array([1])

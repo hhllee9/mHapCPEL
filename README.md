@@ -48,7 +48,10 @@ random.seed(42)
 np.random.seed(42)
 
 # 3. Run parameter estimation
-n_list, theta, _ = F._cal_cpel(cpg_sites_file, data, chr=chr1, start=start, end=end, step=250, compress=False, vis=False)
+n_list, theta, _ = F._cal_cpel(
+    cpg_sites_file, data, chr=chr, start=start, end=end, step=250,
+    compress=False, vis=False, filter_coverage=False
+)
 print((n_list, theta))
 
 ```
@@ -56,8 +59,60 @@ Output Result:
 |  Sub-region | $R_1$ | $R_2$ | $R_3$ | $R_4$ |
 | :--- | :---: | :---: | :---: | :---: |
 | **No. of CpG sites** | 38 | 46 | 29 | 10 |
-| **$\alpha$** | `0.58661831` | `0.29509442` | `-4.99925082` | `-2.01572819` |
-| **$\beta$** | `0.28081937` *(Global)* | | | |
+| **$\alpha$** | ` 0.586588` | `0.29507845` | `-4.99327237` | `3.74264579` |
+| **$\beta$** | `0.28083722` *(Global)* | | | |
+
+The table above is a historical output without coverage filtering. With filtering
+enabled, a region that fails the thresholds returns an empty `theta` instead.
+
+### Coverage filtering
+
+`_cal_cpel` accepts these optional keyword arguments:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `filter_coverage` | `False` | Enable both coverage thresholds; off preserves existing calls. |
+| `min_cov` | `5.0` | Minimum mean observations per CpG, inclusive. |
+| `max_zero_frac` | `0.2` | Maximum fraction of CpGs without observations, inclusive. |
+
+Mean coverage is the number of observed read-CpG entries divided by **all** CpGs
+in the region, including uncovered CpGs. mHap read multiplicities are included.
+Both thresholds must pass. Thresholds are evaluated before parameter estimation.
+The return value remains `(n_list, theta, metrics)`. For a skipped region,
+`theta=[]`, `metrics["skipped"]=True`, and `metrics["skip_reason"]` explains why.
+Regions with no CpGs or no informative reads are skipped even when filtering is off.
+Always check `metrics["skipped"]` before computing downstream model statistics.
+
+Windows containing no CpG sites are omitted from `n_list`. A window containing
+CpGs that have no reads is different: its CpGs remain in the coverage denominator.
+The requested filter operates on the whole region, not separately on each window.
+
+```Python
+n_list, theta, metrics = F._cal_cpel(
+    cpg_sites_file, data, chr=chr, start=start, end=end, step=250,
+    compress=False, vis=False, filter_coverage=True,
+    min_cov=5.0, max_zero_frac=0.2,
+)
+>>> if metrics["skipped"]:
+...     print("Skipped:", metrics["skip_reason"])
+print((n_list, theta, metrics))
+```
+
+Output Result:  
+Skipped reasons: `mean_cov_below_min;zero_frac_above_max`
+
+| Metric | Value | Description |
+|---|---|---|
+| `mean_cov` | 1.00813 | Average read coverage across all CpG sites in the region: the total number of observed CpG states across all reads within the region divided by the total number of CpG sites in the region. |
+| `zero_cpg` | 66 | Number of CpG sites with zero read coverage. |
+| `total_cpg` | 123 | Total number of CpG sites in the region, including those with zero read coverage. |
+| `zero_frac` | 0.53659 | Proportion of CpG sites with zero read coverage, calculated as `zero_cpg / total_cpg`. |
+| `skipped` | `True` | Parameter estimation was skipped because the region failed the coverage filters. |
+| `skip_reason` | `mean_cov_below_min;zero_frac_above_max` | Average read coverage is below 5, and the proportion of CpG sites with zero read coverage exceeds 0.2. |
+
+
+
+
 
 ## Simulations
 We provide a standalone module to run Monte Carlo simulations to validate the performance and statistical power of the newly introduced metrics in differential analysis.

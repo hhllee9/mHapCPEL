@@ -28,18 +28,18 @@ def gen_x_mc(n, θ):
         return x 
 
     for i in range(1, total_len):
-        expaux = np.exp(alpha[subid[i] - 1] + beta * x[i - 1])
+        log_odds = 2.0 * (alpha[subid[i] - 1] + beta * x[i - 1])
 
         if i < total_len - 1:
-            ap1p = 2.0 * beta + alpha[subid[i] - 1]
-            ap1m = -2.0 * beta + alpha[subid[i] - 1]
+            ap1p = 2.0 * beta + alpha[subid[i + 1] - 1]
+            ap1m = -2.0 * beta + alpha[subid[i + 1] - 1]
             uniq, counts = np.unique(subid[i + 1:], return_counts=True)
             n_miss = counts.astype(int)
-            gp = float(comp_g(n_miss, alpha[uniq - 1], beta, ap1p, alpha[-1]))
-            gm = float(comp_g(n_miss, alpha[uniq - 1], beta, ap1m, alpha[-1]))
-            p = gp * expaux / (gp * expaux + gm / expaux)
+            log_gp = float(comp_log_g(n_miss, alpha[uniq - 1], beta, ap1p, alpha[-1]))
+            log_gm = float(comp_log_g(n_miss, alpha[uniq - 1], beta, ap1m, alpha[-1]))
+            p = float(expit(log_odds + log_gp - log_gm))
         else:
-            p = expaux / (expaux + 1.0 / expaux)
+            p = float(expit(log_odds))
 
        # x[i] = choice([-1, 1], p=[1 - p, p])
         x[i] = 1 if np.random.rand() < p else -1

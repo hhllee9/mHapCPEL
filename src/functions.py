@@ -76,7 +76,21 @@ def visualize_xobs(xobs: List[List[int]], title: str):
     plt.show()
 
 ## Compute n_list and theta_list for a single input file
-def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,vis=False):
+def _cal_cpel(cpg_sites_file, data, chr, start, end, step=500, compress=False,
+              vis=False, *, filter_coverage=False, min_cov=5.0, max_zero_frac=0.2):
+    """Estimate one region; optionally require coverage >= min_cov and zero_frac <= limit.
+
+    Returns (CpG counts, theta, metrics). Skipped regions return theta=[] and
+    metrics['skip_reason']. The coverage denominator includes every CpG in the
+    region, including uncovered sites. Empty genomic windows have no parameter.
+    Filtering defaults to off for compatibility with existing callers.
+    """
+    if step <= 0 or end < start:
+        raise ValueError("step must be positive and end must be >= start")
+    if not np.isfinite(min_cov) or min_cov < 0:
+        raise ValueError("min_cov must be finite and nonnegative")
+    if not np.isfinite(max_zero_frac) or not 0 <= max_zero_frac <= 1:
+        raise ValueError("max_zero_frac must lie in [0, 1]")
 
     cpg_n_list =[]  # CpG count for each segment
     xobs = []  # observation matrix
@@ -95,13 +109,17 @@ def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,v
         if cnt > 0:            # keep only segments with >0 CpGs
             cpg_n_list.append(cnt)
 
-        total_cpg_total = sum(cpg_n_list)
-        metrics = {
-            "mean_cov": 0.0,
-            "zero_cpg": total_cpg_total,             # treat as fully uncovered on early exit
-            "total_cpg": total_cpg_total,
-            "zero_frac": (1.0 if total_cpg_total > 0 else float("nan")),
-        }
+    total_cpg_total = sum(cpg_n_list)
+    metrics = {
+        "mean_cov": 0.0,
+        "zero_cpg": total_cpg_total,
+        "total_cpg": total_cpg_total,
+        "zero_frac": (1.0 if total_cpg_total > 0 else float("nan")),
+        "skipped": True,
+        "skip_reason": "no_cpg" if not total_cpg_total else "no_reads",
+    }
+    if not total_cpg_total:
+        return cpg_n_list, [], metrics
 
 
     # Extract reads overlapping the full target interval from the raw data
@@ -129,6 +147,10 @@ def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,v
     # Remove invalid rows comprised entirely of -1
     
     xobs_arr = np.array(xobs, dtype=int)
+    if xobs_arr.size == 0:
+        return cpg_n_list, [], metrics
+    if xobs_arr.ndim != 2 or xobs_arr.shape[1] != total_cpg_total:
+        raise ValueError("xobs column count does not match the region's CpG counts")
     new_xobs = np.zeros_like(xobs_arr) # default value 0 corresponds to -1
     new_xobs[xobs_arr == 0] = -1      # map 0 to -1
     new_xobs[xobs_arr == 1] = 1   
@@ -136,6 +158,9 @@ def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,v
     
         # Keep rows that are not entirely zero
     new_xobs= new_xobs[~(new_xobs == 0).all(axis=1)]
+    if len(new_xobs) == 0:
+        metrics["skip_reason"] = "no_observed_cpg"
+        return cpg_n_list, [], metrics
     
 
 
@@ -158,8 +183,19 @@ def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,v
         "zero_cpg": zero_cpg,
         "total_cpg": total_cpg,
         "zero_frac": zero_frac,
+        "skipped": False,
+        "skip_reason": None,
     }
 
+    if filter_coverage:
+        reasons = []
+        if mean_cov < min_cov:
+            reasons.append("mean_cov_below_min")
+        if zero_frac > max_zero_frac:
+            reasons.append("zero_frac_above_max")
+        if reasons:
+            metrics.update(skipped=True, skip_reason=";".join(reasons))
+            return cpg_n_list, [], metrics
 
     if compress==True:
         xobs = compress_xobs(xobs)
@@ -176,10 +212,17 @@ def _cal_cpel(cpg_sites_file, data ,chr ,start ,end ,step=500 ,compress=False ,v
 
 
 
-def process_files(folder_path, chr, start, end, step, compress=False, vis=False):
+def process_files(folder_path, chr, start, end, step, compress=False, vis=False,
+                  *, cpg_sites_file=None, filter_coverage=False, min_cov=5.0,
+                  max_zero_frac=0.2):
     """
     Process all files in a folder and compute theta values.
+    A skipped sample retains an empty list in theta_list to preserve file order.
     """
+    if cpg_sites_file is None:
+        cpg_sites_file = globals().get("cpg_sites_file")
+    if cpg_sites_file is None:
+        raise ValueError("Pass cpg_sites_file to process_files")
     theta_list = []
     n_list = None
 
@@ -191,7 +234,10 @@ def process_files(folder_path, chr, start, end, step, compress=False, vis=False)
     for file in file_list:
         file_path = os.path.join(folder_path, file)
         data = pd.read_csv(file_path, sep='\t', header=None, dtype={3: 'str'})
-        current_n, current_theta = _cal_cpel(cpg_sites_file, data, chr=chr, start=start, end=end, step=step, compress=compress, vis=vis)
+        current_n, current_theta, metrics = _cal_cpel(
+            cpg_sites_file, data, chr=chr, start=start, end=end, step=step,
+            compress=compress, vis=vis, filter_coverage=filter_coverage,
+            min_cov=min_cov, max_zero_frac=max_zero_frac)
 
         # Ensure n_list is consistent across all files
         if n_list is None:
@@ -199,10 +245,8 @@ def process_files(folder_path, chr, start, end, step, compress=False, vis=False)
         else:
             assert n_list == current_n, "n_list mismatch"
         print(file, current_theta)
+        if metrics["skipped"]:
+            print("Skipped:", metrics["skip_reason"])
         theta_list.append(current_theta)
 
     return n_list, theta_list
-
-
-
-    
