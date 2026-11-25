@@ -11,6 +11,125 @@ from itertools import combinations
 from math import comb  
 
 
+OBSERVED_METRIC_NAMES = (
+    'MML', 'NME', 'PDR', 'CHALM', 'MCR', 'FDRP', 'qFDRP',
+    'RC', 'CC', 'NRC', 'NCC',
+)
+
+
+def _unmat_permutation_plan(m1, m2, Lmax):
+    """Keep the original combination order and NumPy random-number stream."""
+    L = comb(m1 + m2, m1)
+    exact = L < Lmax
+    comb_iter = combinations(range(m1 + m2), m1)
+    if exact:
+        return list(comb_iter), exact
+    ind_subset = np.random.choice(L, Lmax, replace=False)
+    return [ids for idx, ids in enumerate(comb_iter) if idx in ind_subset], exact
+
+
+def _mat_permutation_plan(m, Lmax):
+    """Keep the original sign ranks, including repeated Monte Carlo draws."""
+    exact = 2**m < Lmax
+    if exact:
+        return list(range(2**m)), exact
+    return [random.randint(0, 2**m - 1) for _ in range(Lmax)], exact
+
+
+def _permutation_pvalue(stat_val, perms, exact, two_sided=True, tie_tolerance=0.0):
+    values = np.asarray(perms)
+    threshold = stat_val
+    if two_sided:
+        values = np.abs(values)
+        threshold = abs(stat_val)
+    extreme = values >= threshold
+    if tie_tolerance:
+        extreme |= np.isclose(values, threshold, rtol=tie_tolerance, atol=tie_tolerance)
+    count = np.count_nonzero(extreme)
+    if exact:
+        return float(count / len(values))
+    return float((1.0 + count) / (1.0 + len(values)))
+
+
+def _validate_observed_values(values1, values2, Lmax, test_types, paired=False):
+    values1 = np.asarray(values1, dtype=float)
+    values2 = np.asarray(values2, dtype=float)
+    if values1.ndim != 2 or values2.ndim != 2:
+        raise ValueError('Observed values must be sample-by-metric matrices.')
+    if values1.shape[0] == 0 or values2.shape[0] == 0:
+        raise ValueError('Each group must contain at least one sample.')
+    if values1.shape[1] == 0 or values1.shape[1] != values2.shape[1]:
+        raise ValueError('Groups must have the same nonzero number of metric columns.')
+    if paired and values1.shape != values2.shape:
+        raise ValueError('Paired groups must contain the same number of samples.')
+    if isinstance(Lmax, (bool, np.bool_)) or not isinstance(Lmax, (int, np.integer)) or Lmax < 1:
+        raise ValueError('Lmax must be a positive integer.')
+    names = list(OBSERVED_METRIC_NAMES) if test_types is None else list(test_types)
+    if len(names) != values1.shape[1]:
+        raise ValueError('test_types must give one name for each metric column.')
+    allowed = {name.lower() for name in OBSERVED_METRIC_NAMES}
+    if any(not isinstance(name, str) or name.lower() not in allowed for name in names):
+        raise ValueError('Unknown observed metric name.')
+    if len({name.lower() for name in names}) != len(names):
+        raise ValueError('Metric column names must be unique (ignoring case).')
+    return values1, values2, names
+
+
+def unmat_observed_tests(values1, values2, Lmax=1000, test_types=None):
+    """Compare observed sample metrics using the existing unpaired label test.
+
+    Rows are biological samples; columns are metrics named by ``test_types``.
+    Names are case-insensitive and preserved in the result. If omitted, all
+    eleven ``OBSERVED_METRIC_NAMES`` columns are required in that order.
+    Any nonfinite sample invalidates its entire metric column, without dropping
+    samples. Two-sided ties use a 1e-12 absolute/relative floating-point tolerance.
+    """
+    values1, values2, names = _validate_observed_values(
+        values1, values2, Lmax, test_types)
+    plans, exact = _unmat_permutation_plan(len(values1), len(values2), Lmax)
+    pooled = np.concatenate((values1, values2), axis=0)
+    results = {}
+    for column, name in enumerate(names):
+        if not np.all(np.isfinite(pooled[:, column])):
+            results[name] = (np.nan, np.nan)
+            continue
+        stat_val = float(np.mean(values1[:, column]) - np.mean(values2[:, column]))
+        perms = []
+        for ids in plans:
+            ids = list(ids)
+            first = pooled[ids, column]
+            second = np.delete(pooled[:, column], ids, axis=0)
+            perms.append(float(np.mean(first) - np.mean(second)))
+        results[name] = (stat_val, _permutation_pvalue(
+            stat_val, perms, exact, tie_tolerance=1e-12))
+    return results
+
+
+def mat_observed_tests(values1, values2, Lmax=1000, test_types=None):
+    """Compare observed paired sample metrics using the existing sign test.
+
+    Rows must be matched in the same order. Column names, nonfinite handling,
+    and floating-point tie handling follow ``unmat_observed_tests``. The shared
+    sign plan uses every sign assignment when 2**n_pairs < Lmax; otherwise it
+    draws Lmax sign assignments with replacement, as in ``mat_tests``.
+    """
+    values1, values2, names = _validate_observed_values(
+        values1, values2, Lmax, test_types, paired=True)
+    js, exact = _mat_permutation_plan(len(values1), Lmax)
+    results = {}
+    for column, name in enumerate(names):
+        if not (np.all(np.isfinite(values1[:, column]))
+                and np.all(np.isfinite(values2[:, column]))):
+            results[name] = (np.nan, np.nan)
+            continue
+        diffs = values1[:, column] - values2[:, column]
+        stat_val = float(sum(diffs) / len(diffs))
+        perms = comp_mat_perm_stats(diffs, js)
+        results[name] = (stat_val, _permutation_pvalue(
+            stat_val, perms, exact, tie_tolerance=1e-12))
+    return results
+
+
 def get_all_grad_logZs(n: np.ndarray, θs:np.ndarray) -> np.ndarray:
     if θs.ndim == 1:
         θs = θs.reshape(1, -1)
@@ -266,19 +385,7 @@ def unmat_tests(n, θ1s, θ2s, Lmax=1000,test_types=None):
         diff_stats['mcr'] = comp_unmat_stat_mcr(n, θ1s, θ2s, grad_logZ1s, grad_logZ2s)
 
     
-    # Compute number of possible randomizations
-    L = comb(len(θ1s) + len(θ2s), len(θ1s))
-    exact = L < Lmax
-
-    # Create iterable object with all combinations
-    comb_iter = combinations(range(len(θ1s) + len(θ2s)), len(θ1s))
-
-    # Get group label combinations to use
-    if exact:
-        comb_iter_used = list(comb_iter)
-    else:
-        ind_subset = np.random.choice(L, Lmax, replace=False)
-        comb_iter_used = [comb for idx, comb in enumerate(comb_iter) if idx in ind_subset]
+    comb_iter_used, exact = _unmat_permutation_plan(len(θ1s), len(θ2s), Lmax)
 
     perm_results = {t: [] for t in test_types}
 
@@ -302,18 +409,7 @@ def unmat_tests(n, θ1s, θ2s, Lmax=1000,test_types=None):
     for t in test_types:
         stat_val = diff_stats[t]
         perms = np.array(perm_results[t])
-        n_perms = len(perms)
-        
-        if t == 'pdm':
-            if exact:
-                pval = np.sum(perms >= stat_val) / n_perms
-            else:
-                pval = (1.0 + np.sum(perms >= stat_val)) / (1.0 + n_perms)
-        else:
-            if exact:
-                pval = np.sum(np.abs(perms) >= abs(stat_val)) / n_perms
-            else:
-                pval = (1.0 + np.sum(np.abs(perms) >= abs(stat_val))) / (1.0 + n_perms)
+        pval = _permutation_pvalue(stat_val, perms, exact, two_sided=t != 'pdm')
         
         results[t] = (stat_val, float(pval))
 
@@ -482,11 +578,7 @@ def mat_tests(n, θ1s, θ2s, Lmax=1000, test_types=None):
         results['pdm'] = (tpdm_stat, np.nan)
 
     # 3. 置换检验设置
-    exact = 2**len(θ1s) < Lmax
-    if exact:
-        js = list(range(2**len(θ1s)))
-    else:
-        js = [random.randint(0, 2**len(θ1s) - 1) for _ in range(Lmax)]
+    js, exact = _mat_permutation_plan(len(θ1s), Lmax)
 
     # 4. 计算 P 值
     for t in test_types:
@@ -498,10 +590,7 @@ def mat_tests(n, θ1s, θ2s, Lmax=1000, test_types=None):
         # 计算差异统计量（均值）
         stat_val = sum(diffs) / len(diffs)
 
-        if exact:
-            pval = np.sum(np.abs(perms) >= np.abs(stat_val)) / len(perms)
-        else:
-            pval = (1.0 + np.sum(np.abs(perms) >= np.abs(stat_val))) / (1.0 + len(perms))
+        pval = _permutation_pvalue(stat_val, perms, exact)
         
         results[t] = (stat_val, float(pval))
 

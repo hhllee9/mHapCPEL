@@ -84,6 +84,7 @@ def _cal_cpel(cpg_sites_file, data, chr, start, end, step=500, compress=False,
     metrics['skip_reason']. The coverage denominator includes every CpG in the
     region, including uncovered sites. Empty genomic windows have no parameter.
     Filtering defaults to off for compatibility with existing callers.
+    Returned window counts include zeros; only nonempty windows enter the model.
     """
     if step <= 0 or end < start:
         raise ValueError("step must be positive and end must be >= start")
@@ -92,7 +93,7 @@ def _cal_cpel(cpg_sites_file, data, chr, start, end, step=500, compress=False,
     if not np.isfinite(max_zero_frac) or not 0 <= max_zero_frac <= 1:
         raise ValueError("max_zero_frac must lie in [0, 1]")
 
-    cpg_n_list =[]  # CpG count for each segment
+    cpg_n_list =[]  # CpG count for every physical window, including zeros.
     xobs = []  # observation matrix
     # new_xobs = []  # observation matrix used for downstream estimation
 
@@ -106,8 +107,7 @@ def _cal_cpel(cpg_sites_file, data, chr, start, end, step=500, compress=False,
         # print(f"Number of CpGs in [{current_start}, {current_end}]:", len(cpg_in_range))
         # CpG count for this segment
         cnt = len(cpg_in_range)
-        if cnt > 0:            # keep only segments with >0 CpGs
-            cpg_n_list.append(cnt)
+        cpg_n_list.append(cnt)
 
     total_cpg_total = sum(cpg_n_list)
     metrics = {
@@ -200,6 +200,7 @@ def _cal_cpel(cpg_sites_file, data, chr, start, end, step=500, compress=False,
     if compress==True:
         xobs = compress_xobs(xobs)
     cpg_n = np.array(cpg_n_list, dtype=int)
+    cpg_n = cpg_n[cpg_n > 0]
     ##计算theta？？xbox没有标准化-1→0,1→1,0→-1 ,改为new_xobs 
     theta = inf.est_theta_sa(cpg_n ,new_xobs)
 
@@ -238,6 +239,8 @@ def process_files(folder_path, chr, start, end, step, compress=False, vis=False,
             cpg_sites_file, data, chr=chr, start=start, end=end, step=step,
             compress=compress, vis=vis, filter_coverage=filter_coverage,
             min_cov=min_cov, max_zero_frac=max_zero_frac)
+        # Preserve this batch API's model-count convention for existing callers.
+        current_n = [count for count in current_n if count > 0]
 
         # Ensure n_list is consistent across all files
         if n_list is None:

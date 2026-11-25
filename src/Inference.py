@@ -155,7 +155,7 @@ def get_grad_logZ(n:np.ndarray, θhat: np.ndarray) -> np.ndarray:
         return comp_logZ(n, θ[:-1], θ[-1])
 
 
-    grad_logZ = approx_derivative(f, θhat, method="3-point",rel_step=1e-6)  
+    grad_logZ = approx_derivative(f, θhat, method="3-point")  
     return grad_logZ
 
 

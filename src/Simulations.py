@@ -6,6 +6,7 @@ from scipy.special import expit
 from numpy.random import choice 
 import sys
 import os
+import random
 
 def gen_x_mc(n, θ):
     alpha = θ[:-1]
@@ -169,10 +170,23 @@ def mat_pvalue_ecdf(m: int, n: np.ndarray, θ1: np.ndarray, θ2: np.ndarray):
 
 
 
+def simulation_param_string(m, n, theta1, theta2):
+    """Keep legacy single-region names; encode every region and parameter otherwise."""
+    n_str = "_".join(str(int(value)) for value in n)
+    theta1_str = "_".join(str(float(value)) for value in theta1)
+    theta2_str = "_".join(str(float(value)) for value in theta2)
+    return f"m{m}_n{n_str}_theta1_{theta1_str}_theta2_{theta2_str}"
+
+
 if __name__ == "__main__":
+    # Seed once per run; groups and iterations continue the random streams.
+    seed = 42
+    np.random.seed(seed)
+    random.seed(seed)
+
     if len(sys.argv) < 6:
-        print("usage: python Simulations_new.py <unmat/mat> <m> <n> <theta1> <theta2>")
-        print("Example: python Simulations_new.py unmat 5 4 0.5,0.5 0.5,0.5")
+        print("usage: python Simulations.py <unmat/mat> <m> <n1[,n2,...]> <alpha1[,alpha2,...],beta> <theta2>")
+        print("Examples: unmat 5 4 0.5,0.5 0.5,0.5; unmat 5 5,5 -1,-0.5,1 0,-0.5,-1")
         sys.exit(1)
 
     func_name = sys.argv[1]
@@ -180,9 +194,16 @@ if __name__ == "__main__":
     n = np.fromstring(sys.argv[3], sep=',', dtype=int).reshape(-1)
     θ1 = np.fromstring(sys.argv[4], sep=',', dtype=float).reshape(-1)
     θ2 = np.fromstring(sys.argv[5], sep=',', dtype=float).reshape(-1)
+    if func_name not in ("unmat", "mat"):
+        sys.exit("mode must be unmat or mat")
+    if m < 1 or n.size == 0 or np.any(n <= 0):
+        sys.exit("m and all subregion CpG counts must be positive")
+    for label, theta in (("theta1", θ1), ("theta2", θ2)):
+        if theta.size != n.size + 1 or not np.isfinite(theta).all():
+            sys.exit(f"{label} must contain {n.size} finite alpha values followed by one finite beta")
     output_dir = "simulation_data"
     os.makedirs(output_dir, exist_ok=True)
-    param_str = f"m{m}_n{n[0]}_theta1_{θ1[0]}_{θ1[1]}_theta2_{θ2[0]}_{θ2[1]}"
+    param_str = simulation_param_string(m, n, θ1, θ2)
     if func_name == "unmat":
         print(f"Starting unpaired simulation...: m={m}, n={n}, θ1={θ1}, θ2={θ2}")
         ecdf_funcs, pvals_dict = unmat_pvalue_ecdf(m, n, θ1, θ2)
